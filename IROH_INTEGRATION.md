@@ -67,7 +67,7 @@ cargo test -p homestar-runtime --features iroh --lib network::iroh
 - [x] Add `iroh` optional dependency + `iroh` feature flag
 - [x] Add `network::iroh` module skeleton with `IrohEndpoint`
 - [x] Wire module into `network/mod.rs`
-- [ ] Multi-node test harness with Iroh peers (Phase 1)
+- [x] Multi-node test harness with Iroh peers (Phase 1)
 - [ ] NAT traversal validation against Iroh relay (Phase 2)
 - [ ] Iroh metrics wired into the runtime metrics pipeline (Phase 2)
 - [ ] Blob transfer prototype (Iroh blobs ↔ Homestar receipts/workflows)
