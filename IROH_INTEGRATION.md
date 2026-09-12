@@ -71,7 +71,7 @@ cargo test -p homestar-runtime --features iroh --lib network::iroh
 - [x] NAT traversal validation against Iroh relay (Phase 2)
 - [x] Iroh metrics wired into the runtime metrics pipeline (Phase 2)
 - [x] Cross-network NAT traversal test (Mac ↔ telour via n0 relay)
-- [ ] Blob transfer prototype (Iroh blobs ↔ Homestar receipts/workflows)
+- [x] Blob transfer prototype (receipts over QUIC streams)
 - [ ] Open upstream tracking issue / discussion
 
 ## Cross-network NAT traversal test

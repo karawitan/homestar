@@ -10,6 +10,7 @@
 //! `IROH_INTEGRATION.md` and on the Homestar roadmap (PR #306, Phase 1 & 2):
 //!   - Phase 1: multi-node testing with Iroh peers
 //!   - Phase 2: Iroh integration, esp. NAT traversal; iroh metrics
+//!   - Blob transfer prototype (receipts over QUIC streams)
 //!
 //! [Homestar]: crate
 //! [iroh]: iroh
@@ -25,6 +26,10 @@ use tracing::info;
 /// Both peers must agree on this to establish a connection. Future work will
 /// likely make this configurable.
 pub(crate) const HOMESTAR_ALPN: &[u8] = b"/homestar/1";
+
+/// ALPN for the receipt transfer protocol. Used to distinguish receipt
+/// transfer connections from other Homestar Iroh traffic.
+pub(crate) const RECEIPT_ALPN: &[u8] = b"/homestar/receipt/1";
 
 /// Iroh endpoint wrapper, holding a bound [Endpoint] and the local node's
 /// [EndpointId].
@@ -150,6 +155,61 @@ impl IrohEndpoint {
     /// [EndpointMetrics]: iroh::metrics::EndpointMetrics
     pub(crate) fn metrics(&self) -> &iroh::metrics::EndpointMetrics {
         self.endpoint.metrics()
+    }
+
+    /// Send a blob (DAG-CBOR encoded Homestar [Receipt]) to a remote peer over
+    /// a QUIC bi-stream.
+    ///
+    /// This is a prototype for the "Iroh blobs ↔ Homestar receipts" integration.
+    /// In production, this would use the iroh-blobs crate for content-addressed
+    /// (BLAKE3) verified streaming. For now, we transfer raw bytes over a QUIC
+    /// bi-stream, which is sufficient to validate the integration path.
+    ///
+    /// The `blob` bytes should be DAG-CBOR encoded (see `Receipt::try_into`).
+    /// Returns the number of bytes sent.
+    ///
+    /// [Receipt]: crate::Receipt
+    pub(crate) async fn send_blob(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        alpn: &[u8],
+        blob: &[u8],
+    ) -> Result<usize> {
+        let conn = self.endpoint.connect(addr, alpn).await.context("connect failed")?;
+        let (mut send, mut recv) = conn.open_bi().await.context("open_bi failed")?;
+
+        send.write_all(blob).await.context("write_all failed")?;
+        send.finish().context("finish failed")?;
+
+        // Wait for the receiver to acknowledge by reading back a 1-byte ack.
+        let mut ack = [0u8; 1];
+        recv.read_exact(&mut ack).await.context("read ack failed")?;
+        if ack[0] != 1 {
+            anyhow::bail!("receiver sent invalid ack: {}", ack[0]);
+        }
+
+        conn.close(0u32.into(), b"done");
+        Ok(blob.len())
+    }
+
+    /// Receive a blob from a remote peer on a QUIC bi-stream.
+    ///
+    /// Reads all bytes from the incoming stream, sends a 1-byte ack back to
+    /// the sender, and returns the received bytes.
+    ///
+    /// This is the server-side counterpart to [`IrohEndpoint::send_blob`].
+    pub(crate) async fn receive_blob(conn: &Connection) -> Result<Vec<u8>> {
+        let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi failed")?;
+        let blob = recv
+            .read_to_end(10 * 1024 * 1024)
+            .await
+            .context("read_to_end failed")?;
+
+        // Send a 1-byte ack back to the sender.
+        send.write_all(&[1u8]).await.context("write ack failed")?;
+        send.finish().context("finish failed")?;
+
+        Ok(blob)
     }
 }
 
@@ -456,5 +516,96 @@ mod tests {
             net_reports >= 1,
             "expected net_report reports >= 1, got {net_reports}"
         );
+    }
+
+    /// Blob transfer test: send a raw byte blob from client to server over a
+    /// QUIC bi-stream using the `send_blob` / `receive_blob` helpers.
+    ///
+    /// This validates the primitive that would be used to transfer DAG-CBOR
+    /// encoded Homestar receipts between nodes.
+    #[tokio::test]
+    async fn blob_transfer_roundtrip() {
+        let server = IrohEndpoint::bind_with_alpn(&[RECEIPT_ALPN])
+            .await
+            .expect("failed to bind server endpoint");
+        let server_addr = server.addr();
+
+        let client = IrohEndpoint::bind()
+            .await
+            .expect("failed to bind client endpoint");
+
+        // Spawn the server: accept one connection, receive the blob.
+        let server_ep = server.endpoint().clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("accept failed");
+            let conn = incoming.await.expect("connection failed");
+            let blob = IrohEndpoint::receive_blob(&conn)
+                .await
+                .expect("receive_blob failed");
+            conn.closed().await;
+            blob
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Client sends a blob that looks like a DAG-CBOR encoded receipt.
+        let blob = b"\xa4\x63ran\xd8X\x1a\x00\x00\x00\x01\x63out\xf5\x63prf\x80\x64meta\xf6";
+        let n = client
+            .send_blob(server_addr, RECEIPT_ALPN, blob)
+            .await
+            .expect("send_blob failed");
+
+        assert_eq!(n, blob.len(), "bytes sent mismatch");
+
+        let received = server_task.await.expect("server task panicked");
+        assert_eq!(received, blob, "received blob does not match sent blob");
+    }
+
+    /// Blob transfer test: send multiple blobs sequentially from client to
+    /// server, verifying that each arrives intact.
+    #[tokio::test]
+    async fn multiple_blob_transfer() {
+        let server = IrohEndpoint::bind_with_alpn(&[RECEIPT_ALPN])
+            .await
+            .expect("failed to bind server endpoint");
+        let server_addr = server.addr();
+
+        let client = IrohEndpoint::bind()
+            .await
+            .expect("failed to bind client endpoint");
+
+        // Spawn the server: accept 3 connections, receive 3 blobs.
+        let server_ep = server.endpoint().clone();
+        let server_task = tokio::spawn(async move {
+            let mut blobs = Vec::new();
+            for _ in 0..3 {
+                let incoming = server_ep.accept().await.expect("accept failed");
+                let conn = incoming.await.expect("connection failed");
+                let blob = IrohEndpoint::receive_blob(&conn)
+                    .await
+                    .expect("receive_blob failed");
+                conn.closed().await;
+                blobs.push(blob);
+            }
+            blobs
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Client sends 3 distinct blobs.
+        let blobs: Vec<&[u8]> = vec![b"receipt-1", b"receipt-2-different", b"receipt-3-payload"];
+        for expected in &blobs {
+            let n = client
+                .send_blob(server_addr.clone(), RECEIPT_ALPN, expected)
+                .await
+                .expect("send_blob failed");
+            assert_eq!(n, expected.len(), "bytes sent mismatch");
+        }
+
+        let received = server_task.await.expect("server task panicked");
+        assert_eq!(received.len(), 3, "expected 3 blobs received");
+        assert_eq!(received[0], blobs[0], "blob 1 mismatch");
+        assert_eq!(received[1], blobs[1], "blob 2 mismatch");
+        assert_eq!(received[2], blobs[2], "blob 3 mismatch");
     }
 }
