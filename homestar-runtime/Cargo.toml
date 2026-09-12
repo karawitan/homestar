@@ -86,6 +86,13 @@ humantime = { workspace = true }
 hyper = { version = "0.14", default-features = false }
 indexmap = { workspace = true }
 inquire = "0.6"
+# Iroh networking for NAT traversal and direct peer connectivity.
+# Gated behind the `iroh` feature flag. Note: iroh 1.x requires MSRV 1.89+,
+# while this crate currently declares `rust-version = "1.75.0"`. The `stable`
+# toolchain (>= 1.89) compiles fine; see IROH_INTEGRATION.md for details.
+iroh = { version = "1.0", default-features = false, features = [
+  "tls-ring",
+], optional = true }
 ipfs-api = { version = "0.17", optional = true }
 ipfs-api-backend-hyper = { version = "0.6", default-features = false, features = [
   "with-builder",
@@ -245,6 +252,9 @@ dev = ["ansi-logs", "ipfs", "monitoring", "websocket-notify"]
 ansi-logs = ["tracing-logfmt/ansi_logs"]
 console = ["dep:console-subscriber"]
 ipfs = ["dep:ipfs-api", "dep:ipfs-api-backend-hyper"]
+# Iroh-based networking: NAT traversal, direct QUIC peer connectivity, and
+# blob transfer as an alternative/supplement to the libp2p transport.
+iroh = ["dep:iroh"]
 monitoring = ["dep:sysinfo"]
 profile = ["dep:puffin", "dep:puffin_egui"]
 test-utils = ["dep:proptest", "homestar-invocation/test-utils"]
