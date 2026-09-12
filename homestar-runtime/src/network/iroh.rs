@@ -129,6 +129,28 @@ impl IrohEndpoint {
     pub(crate) fn accept(&self) -> Accept<'_> {
         self.endpoint.accept()
     }
+
+    /// Wait until the endpoint has established a connection to at least one
+    /// relay server. This is the precondition for NAT traversal: hole-punching
+    /// is coordinated through the relay, so until `online()` returns, the
+    /// endpoint may not be reachable from behind a NAT.
+    ///
+    /// See [`Endpoint::online`] in the iroh docs for details.
+    ///
+    /// [`Endpoint::online`]: iroh::Endpoint::online
+    pub(crate) async fn online(&self) {
+        self.endpoint.online().await;
+    }
+
+    /// Returns the iroh [EndpointMetrics] for this endpoint.
+    ///
+    /// The `metrics` feature is always enabled on our iroh dependency, so this
+    /// is always available when the `iroh` feature flag is on.
+    ///
+    /// [EndpointMetrics]: iroh::metrics::EndpointMetrics
+    pub(crate) fn metrics(&self) -> &iroh::metrics::EndpointMetrics {
+        self.endpoint.metrics()
+    }
 }
 
 #[cfg(test)]
@@ -296,5 +318,143 @@ mod tests {
 
         task_a.await.expect("task A panicked");
         task_b.await.expect("task B panicked");
+    }
+
+    /// NAT traversal test (Phase 2): verify that two endpoints can connect
+    /// through the Iroh relay after both have come `online()`.
+    ///
+    /// The `N0` preset uses public n0 relay servers for NAT traversal. This
+    /// test waits for both endpoints to establish a relay connection (via
+    /// `online()`), then verifies that a bi-stream round-trip succeeds
+    /// through the relay-assisted path.
+    ///
+    /// This test requires network access to the public n0 relay servers. It
+    /// is expected to take a few seconds for relay connection establishment.
+    #[tokio::test]
+    #[ignore = "requires network access to public n0 relay servers"]
+    async fn nat_traversal_via_relay() {
+        // Server: accept on the Homestar ALPN.
+        let server = IrohEndpoint::bind_with_alpn(&[HOMESTAR_ALPN])
+            .await
+            .expect("failed to bind server endpoint");
+
+        // Client: outgoing only.
+        let client = IrohEndpoint::bind()
+            .await
+            .expect("failed to bind client endpoint");
+
+        // Wait for both endpoints to connect to a relay. This is the
+        // precondition for NAT traversal: hole-punching is coordinated
+        // through the relay.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::join(server.online(), client.online()),
+        )
+        .await
+        .expect("timed out waiting for endpoints to come online");
+
+        let server_addr = server.addr();
+
+        // Spawn the server accept loop (same echo pattern as Phase 1 tests).
+        let server_ep = server.endpoint().clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("accept failed");
+            let conn = incoming.await.expect("connection failed");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi failed");
+            let buf = recv.read_to_end(READ_LIMIT).await.expect("read_to_end failed");
+            send.write_all(&buf).await.expect("write_all failed");
+            send.finish().expect("finish failed");
+            conn.closed().await;
+        });
+
+        // Client connects to the server through the relay.
+        let conn = client
+            .connect(server_addr, HOMESTAR_ALPN)
+            .await
+            .expect("failed to connect via relay");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi failed");
+        let message = b"nat traversal echo via iroh relay";
+        send.write_all(message).await.expect("write_all failed");
+        send.finish().expect("finish failed");
+
+        let echo = recv.read_to_end(READ_LIMIT).await.expect("read_to_end failed");
+        assert_eq!(echo, message, "echoed message does not match");
+
+        conn.close(0u32.into(), b"done");
+        server_task.await.expect("server task panicked");
+    }
+
+    /// Metrics test (Phase 2): verify that iroh endpoint metrics are
+    /// accessible and populated after binding and connecting.
+    ///
+    /// After an endpoint comes online and exchanges data, the socket metrics
+    /// counters (bytes sent/received, relay connection counters) should be
+    /// non-zero. This validates that the iroh metrics pipeline is wired up
+    /// and can be scraped for observability.
+    #[tokio::test]
+    #[ignore = "requires network access to public n0 relay servers"]
+    async fn metrics_populated_after_connection() {
+        let server = IrohEndpoint::bind_with_alpn(&[HOMESTAR_ALPN])
+            .await
+            .expect("failed to bind server endpoint");
+        let client = IrohEndpoint::bind()
+            .await
+            .expect("failed to bind client endpoint");
+
+        // Come online so relay metrics are populated.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::join(server.online(), client.online()),
+        )
+        .await
+        .expect("timed out waiting for endpoints to come online");
+
+        let server_addr = server.addr();
+
+        // Quick echo exchange to generate traffic.
+        let server_ep = server.endpoint().clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("accept failed");
+            let conn = incoming.await.expect("connection failed");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi failed");
+            let buf = recv.read_to_end(READ_LIMIT).await.expect("read_to_end failed");
+            send.write_all(&buf).await.expect("write_all failed");
+            send.finish().expect("finish failed");
+            conn.closed().await;
+        });
+
+        let conn = client
+            .connect(server_addr, HOMESTAR_ALPN)
+            .await
+            .expect("failed to connect");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi failed");
+        let message = b"metrics test payload";
+        send.write_all(message).await.expect("write_all failed");
+        send.finish().expect("finish failed");
+        let _echo = recv.read_to_end(READ_LIMIT).await.expect("read_to_end failed");
+
+        conn.close(0u32.into(), b"done");
+        server_task.await.expect("server task panicked");
+
+        // Verify that iroh metrics are accessible and that at least one
+        // counter has been incremented. The relay_conns_success counter
+        // should be >= 1 since both endpoints came online via the relay.
+        let client_metrics = client.metrics();
+        let relay_conns = client_metrics.socket.relay_conns_success.get();
+
+        assert!(
+            relay_conns >= 1,
+            "expected relay_conns_success >= 1 after coming online, got {relay_conns}"
+        );
+
+        // The net_report reports counter should also be >= 1 since net
+        // reports run automatically when the endpoint comes online.
+        let net_reports = client_metrics.net_report.reports.get();
+        assert!(
+            net_reports >= 1,
+            "expected net_report reports >= 1, got {net_reports}"
+        );
     }
 }

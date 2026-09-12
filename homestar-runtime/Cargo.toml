@@ -92,6 +92,7 @@ inquire = "0.6"
 # toolchain (>= 1.89) compiles fine; see IROH_INTEGRATION.md for details.
 iroh = { version = "1.0", default-features = false, features = [
   "tls-ring",
+  "metrics",
 ], optional = true }
 ipfs-api = { version = "0.17", optional = true }
 ipfs-api-backend-hyper = { version = "0.6", default-features = false, features = [
