@@ -70,8 +70,26 @@ cargo test -p homestar-runtime --features iroh --lib network::iroh
 - [x] Multi-node test harness with Iroh peers (Phase 1)
 - [x] NAT traversal validation against Iroh relay (Phase 2)
 - [x] Iroh metrics wired into the runtime metrics pipeline (Phase 2)
+- [x] Cross-network NAT traversal test (Mac ↔ telour via n0 relay)
 - [ ] Blob transfer prototype (Iroh blobs ↔ Homestar receipts/workflows)
 - [ ] Open upstream tracking issue / discussion
+
+## Cross-network NAT traversal test
+
+A real cross-network test was performed using the `iroh_echo` example binary
+(see `homestar-runtime/examples/iroh_echo.rs`):
+
+- **Server**: telour.kalou.net (public IP 185.85.241.80, x86_64, Debian 13)
+  — built on pvf, deployed via scp
+- **Client**: Mac (arm64, behind home NAT)
+- **Relay**: n0 public relay `euc1-1.relay.n0.iroh.link`
+- **Result**: ✓ echo round-trip succeeded (25 bytes), connection established
+  through the relay-assisted NAT traversal path
+
+Both endpoints came `online()` via the relay, then the client connected to
+the server's `EndpointAddr` (which included both the relay URL and direct IP).
+The QUIC bi-stream echo completed successfully, confirming end-to-end NAT
+traversal works with the Iroh integration scaffold.
 
 ## References
 
